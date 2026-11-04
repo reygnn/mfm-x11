@@ -4,15 +4,17 @@ PREFIX ?= /usr/local
 PKG_CONFIG ?= pkg-config
 PKGS = x11 xft
 
+# CFLAGS and LDLIBS stay the user's, also on the command line: `make CFLAGS=-O0`
+# must not lose the include paths.
 CFLAGS ?= -O2 -g
-CFLAGS += -std=c11 -Wall -Wextra -Wno-unused-parameter \
+MFM_CFLAGS = -std=c11 -Wall -Wextra -Wno-unused-parameter \
 	$(shell $(PKG_CONFIG) --cflags $(PKGS))
-LDLIBS += $(shell $(PKG_CONFIG) --libs $(PKGS))
+MFM_LIBS = $(shell $(PKG_CONFIG) --libs $(PKGS))
 
 all: mfm
 
 mfm: mfm.c
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ mfm.c $(LDLIBS)
+	$(CC) $(MFM_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ mfm.c $(MFM_LIBS) $(LDLIBS)
 
 install: mfm
 	install -Dm755 mfm $(DESTDIR)$(PREFIX)/bin/mfm

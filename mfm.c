@@ -38,6 +38,7 @@
  */
 #define _GNU_SOURCE
 #include <X11/Xlib.h>
+#include <X11/XKBlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
@@ -54,6 +55,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -128,6 +130,7 @@ static const char *const op_ing[] = { "copying", "moving", "deleting" };
 static const char *const op_ed[] = { "copied", "moved", "deleted" };
 static struct {
 	int fd, op, n, fails;
+	int finished;           /* the worker said it got to its end */
 	unsigned clip_gen;      /* the clipboard a move started from */
 	char dir[PATH_MAX], first[NAME_MAX + 1];
 	char out[512];
@@ -136,9 +139,9 @@ static struct {
 
 /* ---- X ------------------------------------------------------------------ */
 
-static const long EVENT_MASK = ExposureMask | KeyPressMask | ButtonPressMask |
-	ButtonReleaseMask | Button1MotionMask | StructureNotifyMask |
-	FocusChangeMask;
+static const long EVENT_MASK = ExposureMask | KeyPressMask | KeyReleaseMask |
+	ButtonPressMask | ButtonReleaseMask | Button1MotionMask |
+	StructureNotifyMask | FocusChangeMask;
 
 static Display *dpy;
 static int scr, depth;
@@ -253,6 +256,13 @@ static const char *disp(const char *s)
 	return out;
 }
 
+static int is_combining(uint32_t c)
+{
+	return (c >= 0x300 && c <= 0x36f) || (c >= 0x1ab0 && c <= 0x1aff) ||
+		(c >= 0x1dc0 && c <= 0x1dff) || (c >= 0x20d0 && c <= 0x20ff) ||
+		(c >= 0xfe20 && c <= 0xfe2f);
+}
+
 /* Lower case for type-ahead. towlower() only knows non-ASCII letters in a
  * UTF-8 locale, so the common European ranges are folded by hand too. */
 static uint32_t fold(uint32_t c)
@@ -339,10 +349,17 @@ static char *mwmrc_get(const char *key, char *val, size_t n)
 		char *p = line;
 		while (isspace((unsigned char)*p))
 			p++;
-		if (strncmp(p, "Mwm*", 4) || strncmp(p + 4, key, kl) ||
-		    p[4 + kl] != ':')
+		/* As mwm reads it: any case, "." or "*", blanks before the ":". */
+		char *colon = strchr(p, ':');
+		if (!colon)
 			continue;
-		p += 5 + kl;
+		char *ke = colon;
+		while (ke > p && isspace((unsigned char)ke[-1]))
+			ke--;
+		if (strncasecmp(p, "mwm", 3) || (p[3] != '*' && p[3] != '.') ||
+		    (size_t)(ke - (p + 4)) != kl || strncasecmp(p + 4, key, kl))
+			continue;
+		p = colon + 1;
 		while (isspace((unsigned char)*p))
 			p++;
 		char *e = p + strlen(p);
@@ -1230,6 +1247,29 @@ static int place(const char *from, const char *dir, const char *name,
 	return -1;
 }
 
+/* place() for what may be a directory without write permission for its owner:
+ * cp -a keeps that, and renaming a directory to another parent has to update its
+ * "..". It gets its mode back in either case. */
+static int place_any(const char *from, const char *dir, const char *name,
+	int isdir, int move, char *out)
+{
+	struct stat st;
+	int unlock = isdir && lstat(from, &st) == 0 && S_ISDIR(st.st_mode) &&
+		!(st.st_mode & S_IWUSR);
+	if (unlock && chmod(from, (st.st_mode & 07777) | S_IWUSR) < 0)
+		unlock = 0;
+	int r = place(from, dir, name, isdir, move, out), e = errno;
+	if (unlock) {
+		char to[PATH_MAX];
+		const char *now = from;
+		if (r == 0 && join(to, dir, out) == 0)
+			now = to;
+		chmod(now, st.st_mode & 07777);
+	}
+	errno = e;
+	return r;
+}
+
 /* ---- trash (freedesktop.org Trash specification) ------------------------ */
 
 /* mkdir -p with mode 0700 for what is created. */
@@ -1320,11 +1360,11 @@ static int topdir_trash(const char *rpar, uint64_t mnt, char *top,
 	}
 	const char *tp = strcmp(top, "/") ? top : "";
 	unsigned uid = getuid();
-	if (strlen(tp) >= PATH_MAX - 32) {
+	if (strlen(tp) >= PATH_MAX - 32 ||
+	    snprintf(out, PATH_MAX, "%s/.Trash", tp) >= PATH_MAX) {
 		errno = ENAMETOOLONG;
 		return -1;
 	}
-	snprintf(out, PATH_MAX, "%s/.Trash", tp);
 	if (lstat(out, &st) == 0 && S_ISDIR(st.st_mode) &&
 	    (st.st_mode & S_ISVTX)) {
 		snprintf(out, PATH_MAX, "%s/.Trash/%u", tp, uid);
@@ -1516,13 +1556,13 @@ static void report(int out, const char *fmt, ...)
 	dprintf(out, "%s\n", b);
 }
 
-/* Run cp, mv or rm (looked up once) with up to four arguments. */
+/* Run cp, mv, rm or chmod (looked up once) with up to four arguments. */
 static int tool(int which, const char *a1, const char *a2, const char *a3,
 	const char *a4, char *msg, size_t msz)
 {
-	static const char *const names[] = { "cp", "mv", "rm" };
-	static char path[3][PATH_MAX];
-	static int err[3] = { -1, -1, -1 };
+	static const char *const names[] = { "cp", "mv", "rm", "chmod" };
+	static char path[4][PATH_MAX];
+	static int err[4] = { -1, -1, -1, -1 };
 	if (err[which] < 0)
 		err[which] = find_prog(names[which], path[which]);
 	if (err[which]) {
@@ -1542,7 +1582,8 @@ static int tool(int which, const char *a1, const char *a2, const char *a3,
  * into place from there, so a partial copy never shows under the real name
  * and the final name is picked only when it is used: nothing is ever
  * overwritten, not even on a case-insensitive file system. Delete is
- * rm -rf, after making sure there is no mount in the way.
+ * rm -rf, after making sure there is no mount in the way. A NUL byte at the end
+ * tells mfm that the job ran to its end.
  */
 static void worker(int op, const char *sdir, char **names, int n,
 	const char *ddir, int out)
@@ -1578,7 +1619,7 @@ static void worker(int op, const char *sdir, char **names, int n,
 			continue;
 		}
 		if (op == OP_MOVE) {
-			if (place(src, ddir, nm, isdir, 1, final) == 0)
+			if (place_any(src, ddir, nm, isdir, 1, final) == 0)
 				continue;
 			/* EINVAL: into itself, which paste() rules out */
 			if (errno != EXDEV) {
@@ -1595,9 +1636,13 @@ static void worker(int op, const char *sdir, char **names, int n,
 				continue;
 			}
 		}
-		if (join(tmp, ddir, ".mfm-XXXXXX") < 0 || !mkdtemp(tmp) ||
-		    join(t, tmp, nm) < 0) {
+		if (join(tmp, ddir, ".mfm-XXXXXX") < 0 || !mkdtemp(tmp)) {
 			report(out, "%s: %s", nm, strerror(errno));
+			continue;
+		}
+		if (join(t, tmp, nm) < 0) {
+			report(out, "%s: %s", nm, strerror(errno));
+			rmdir(tmp);
 			continue;
 		}
 		int ok = op == OP_COPY ?
@@ -1605,7 +1650,8 @@ static void worker(int op, const char *sdir, char **names, int n,
 			tool(1, "--", src, t, NULL, msg, sizeof msg) == 0;
 		/* A failed mv may have removed part of the source already, so
 		 * whatever arrived is kept, but not under the real name: it may
-		 * be half a file. A failed copy is cleaned up. */
+		 * be half a file. A failed copy is cleaned up, also from the
+		 * read-only directories cp -a made. */
 		if (op == OP_MOVE && !ok) {
 			if (lstat(t, &st) < 0) {
 				report(out, "%s", msg);
@@ -1617,16 +1663,25 @@ static void worker(int op, const char *sdir, char **names, int n,
 			continue;
 		}
 		if (op == OP_COPY && !ok) {
-			report(out, "%s", msg);
-			tool(2, "-rf", "--", tmp, NULL, msg, sizeof msg);
+			char why[sizeof msg];
+			snprintf(why, sizeof why, "%s", msg);
+			tool(3, "-R", "u+w", "--", tmp, msg, sizeof msg);
+			if (tool(2, "-rf", "--", tmp, NULL, msg, sizeof msg) < 0)
+				report(out, "%s (the rest is in %s)", why,
+					strrchr(tmp, '/') + 1);
+			else
+				report(out, "%s", why);
 			continue;
 		}
-		if (place(t, ddir, nm, isdir, op == OP_MOVE, final) < 0) {
+		if (place_any(t, ddir, nm, isdir, op == OP_MOVE, final) < 0) {
 			report(out, "%s: %s (left in %s)", nm, strerror(errno),
 				strrchr(tmp, '/') + 1);
 			continue;
 		}
 		rmdir(tmp);
+	}
+	if (write(out, "", 1) < 0) {
+		/* mfm has quit: nobody to tell */
 	}
 	_exit(0);
 }
@@ -1671,6 +1726,7 @@ static void start_job(int op, const char *sdir, char **names, int n,
 	job.op = op;
 	job.n = n;
 	job.fails = 0;
+	job.finished = 0;
 	job.outlen = 0;
 	job.clip_gen = clip_gen;
 	snprintf(job.dir, sizeof job.dir, "%s", ddir);
@@ -1706,12 +1762,16 @@ static void job_done(void)
 	job.out[strcspn(job.out, "\n")] = 0;
 	/* A move that worked used up the clipboard, unless it was replaced
 	 * in the meantime. */
-	if (job.op == OP_MOVE && !job.fails && job.clip_gen == clip_gen)
+	if (job.op == OP_MOVE && job.finished && !job.fails &&
+	    job.clip_gen == clip_gen)
 		clip_clear();
 	if (reload() == 0 && job.first[0] && !strcmp(cwd, job.dir))
 		select_name(job.first);
 	int ok = job.n - job.fails;
-	if (job.fails)
+	if (!job.finished)
+		set_status(1, "%s stopped unexpectedly, the result may be "
+			"incomplete", op_ing[job.op]);
+	else if (job.fails)
 		set_status(1, "%d of %d failed: %s", job.fails, job.n, job.out);
 	else
 		set_status(0, "%s %d item%s%s", op_ed[job.op], ok,
@@ -1734,6 +1794,10 @@ static void job_poll(void)
 			return;
 		}
 		for (ssize_t i = 0; i < r; i++) {
+			if (!b[i]) {
+				job.finished = 1;
+				continue;
+			}
 			if (job.outlen < sizeof job.out - 1)
 				job.out[job.outlen++] = b[i];
 			job.fails += b[i] == '\n';
@@ -1971,6 +2035,8 @@ static void move_sel(int d)
 	dirty = 1;
 }
 
+static char climb_failed[PATH_MAX];
+
 /* cwd vanished or became unreadable: go to the nearest listable ancestor. */
 static void climb(void)
 {
@@ -1987,6 +2053,7 @@ static void climb(void)
 		}
 	}
 	/* Nothing can be listed. Don't retry until the directory changes. */
+	snprintf(climb_failed, sizeof climb_failed, "%s", cwd);
 	if (stat(cwd, &st) == 0)
 		cwd_mtime = st.st_mtim;
 	cwd_unsure = 0;
@@ -1997,12 +2064,15 @@ static void climb(void)
 static int gone(int e)
 {
 	return e == ENOENT || e == ENOTDIR || e == EACCES || e == EPERM ||
-		e == ELOOP;
+		e == ELOOP || e == ENOTCONN || e == ESTALE;
 }
 
 static void poll_dir(void)
 {
 	struct stat st;
+	/* Nothing above could be listed either: climb() stays put, and would
+	 * try that again every second. */
+	int stuck = !strcmp(cwd, climb_failed);
 	if (stat(cwd, &st) != 0) {
 		if (gone(errno))
 			climb();
@@ -2010,6 +2080,12 @@ static void poll_dir(void)
 	}
 	if (!S_ISDIR(st.st_mode)) {
 		climb();
+		return;
+	}
+	/* chmod does not change the mtime that is checked below. */
+	if (access(cwd, R_OK | X_OK) != 0) {
+		if (gone(errno) && !stuck)
+			climb();
 		return;
 	}
 	if (!cwd_unsure && st.st_mtim.tv_sec == cwd_mtime.tv_sec &&
@@ -2066,14 +2142,21 @@ static int line_key(char *b, size_t sz, size_t *cur, int *fresh, int sel,
 		return 1;
 	case XK_Escape:
 		return -1;
+	/* The cursor stays out of a letter and its combining marks. */
 	case XK_Left: case XK_KP_Left:
-		if (c)
+		while (c) {
 			c = u8_prev(b, c);
+			p = b + c;
+			if (!is_combining(u8_next(&p)))
+				break;
+		}
 		break;
 	case XK_Right: case XK_KP_Right:
 		if (c < len) {
 			p = b + c;
 			u8_next(&p);
+			for (const char *q = p; *q && is_combining(u8_next(&q));)
+				p = q;
 			c = p - b;
 		}
 		break;
@@ -2201,6 +2284,8 @@ static int listed(const char *dir, const char *name)
 	return found;
 }
 
+static int rename_lost;         /* the status line says where the file went */
+
 /* Rename p to q in cwd by way of a temporary name. */
 static int rename_via_tmp(const char *p, const char *q)
 {
@@ -2222,8 +2307,12 @@ static int rename_via_tmp(const char *p, const char *q)
 	if (rename_new(t, q) == 0)
 		return 0;
 	int e = errno;
-	if (rename(t, p) < 0)   /* put it back; failing that, say where */
+	/* Put it back, which must not replace what came up under the old name
+	 * meanwhile. Failing that, say where it is. */
+	if (rename_new(t, p) < 0) {
+		rename_lost = 1;
 		set_status(1, "%s is now %s", strrchr(p, '/') + 1, nm);
+	}
 	errno = e;
 	return -1;
 }
@@ -2308,7 +2397,9 @@ static void prompt_commit(void)
 		r = rename_new(p, q);
 	}
 	if (r < 0) {
-		set_status(1, "cannot rename %s: %s", pold, strerror(errno));
+		if (!rename_lost)
+			set_status(1, "cannot rename %s: %s", pold, strerror(errno));
+		rename_lost = 0;
 		return;
 	}
 	reload();
@@ -3325,8 +3416,40 @@ static void key(KeySym ks, const char *txt, int n, unsigned state)
 		typeahead(txt, n);
 }
 
+/* A held key moves and types, but runs no command again: Delete would empty
+ * the folder into the trash, Return would open a file 25 times a second. */
+static int key_repeats(KeySym ks, const char *txt, int n, unsigned state)
+{
+	if (pend)
+		return 0;
+	switch (ks) {
+	case XK_Up: case XK_KP_Up:
+	case XK_Down: case XK_KP_Down:
+		return !(state & (ControlMask | Mod1Mask));
+	}
+	if (menu_on || (state & (ControlMask | Mod1Mask)))
+		return 0;
+	switch (ks) {
+	case XK_Prior: case XK_KP_Prior:
+	case XK_Next: case XK_KP_Next:
+	case XK_Left: case XK_KP_Left:
+	case XK_Right: case XK_KP_Right:
+	case XK_BackSpace:
+		return 1;
+	case XK_Delete: case XK_KP_Delete:
+		return editing || prompt;
+	}
+	return n > 0 && (unsigned char)txt[0] >= 0x20 && txt[0] != 0x7f;
+}
+
+/* The key that is down, to tell its repeats from a new press: with detectable
+ * auto-repeat they come without a release in between. 0 for none, which is also
+ * what an input method's made-up events have. */
+static KeyCode key_down;
+
 static void on_key(XKeyEvent *ev)
 {
+	int repeat = ev->keycode && ev->keycode == key_down;
 	char sbuf[64], *txt = sbuf, *heap = NULL;
 	KeySym ks = NoSymbol;
 	int n = 0;
@@ -3346,7 +3469,11 @@ static void on_key(XKeyEvent *ev)
 		XLookupString(ev, ignored, sizeof ignored, &ks, NULL);
 		n = keysym_utf8(ks, txt);
 	}
-	key(ks, txt, n, ev->state);
+	/* Shift tapped during a held key must not make its next repeat look new. */
+	if (!IsModifierKey(ks))
+		key_down = ev->keycode;
+	if (!repeat || key_repeats(ks, txt, n, ev->state))
+		key(ks, txt, n, ev->state);
 	free(heap);
 }
 
@@ -3513,6 +3640,7 @@ static void handle(XEvent *ev)
 		}
 		break;
 	case KeyPress: on_key(&ev->xkey); break;
+	case KeyRelease: break;         /* seen before an input method gets it */
 	case ButtonPress: on_button(&ev->xbutton); break;
 	case ButtonRelease: on_release(&ev->xbutton); break;
 	case MotionNotify:
@@ -3527,6 +3655,7 @@ static void handle(XEvent *ev)
 			break;
 		if (ev->type == FocusOut) {
 			focused = 0;
+			key_down = 0;
 			if (xic)
 				XUnsetICFocus(xic);
 			break;
@@ -3627,6 +3756,10 @@ int main(int argc, char **argv)
 		fprintf(stderr, "mfm: cannot open display\n");
 		return 1;
 	}
+	/* Without it a held key is a stream of releases and presses, which look
+	 * like a new press each. */
+	Bool detectable;
+	XkbSetDetectableAutoRepeat(dpy, True, &detectable);
 	scr = DefaultScreen(dpy);
 	root = RootWindow(dpy, scr);
 	vis = DefaultVisual(dpy, scr);
@@ -3680,6 +3813,8 @@ int main(int argc, char **argv)
 		}
 		XEvent ev;
 		XNextEvent(dpy, &ev);
+		if (ev.type == KeyRelease && ev.xkey.keycode == key_down)
+			key_down = 0;
 		if (XFilterEvent(&ev, None))
 			continue;
 		handle(&ev);
