@@ -103,9 +103,16 @@ zu verschieben lehnt mfm ab. Auch Umbenennen überschreibt nichts; ist der
 neue Name vergeben, meldet mfm das. (Einzige Lücke: Dateisysteme ohne
 atomares „umbenennen ohne zu ersetzen“, z. B. NFS, bei Ordnern.)
 
-Endgültiges Löschen ist `rm -rf --one-file-system`: Eingehängte
-Dateisysteme darunter bleiben unberührt, und einen Einhängepunkt selbst
-löscht mfm nicht.
+Scheitert ein Verschieben über Dateisystemgrenzen, z. B. weil das Ziel voll
+ist, bleibt das Angekommene im versteckten `.mfm-XXXXXX`, und die Statuszeile
+nennt den Ordner. Nach dem Fehlschlag ist die Quelle in aller Regel noch
+vollständig.
+
+Endgültiges Löschen ist `rm -rf --one-file-system`. Einen Einhängepunkt selbst
+und einen Ordner, in dem etwas eingehängt ist, löscht mfm nicht, auch nicht
+Bind-Mounts vom selben Dateisystem, deren Inhalt `rm` sonst leeren würde. Auch
+verschieben lässt sich ein Einhängepunkt nicht, und über Dateisystemgrenzen auch
+kein Ordner, in dem etwas eingehängt ist; kopieren geht.
 
 Der Papierkorb folgt der freedesktop.org-Spezifikation, Dateien lassen
 sich also mit jedem Dateimanager wiederherstellen, der sie kennt (oder per

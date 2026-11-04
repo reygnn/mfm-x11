@@ -1081,6 +1081,49 @@ static int is_mount(const char *path)
 		a != b;
 }
 
+/* Is anything mounted below the directory path? -1 if that cannot be told.
+ * rm --one-file-system only compares devices, so it walks into a bind mount of
+ * the same file system and empties what that shows. */
+static int mount_below(const char *path)
+{
+	char real[PATH_MAX];
+	char *line = NULL;
+	size_t cap = 0;
+	int found = 0;
+	if (!realpath(path, real))
+		return -1;
+	FILE *f = fopen("/proc/self/mountinfo", "r");
+	if (!f)
+		return -1;
+	size_t n = strlen(real);
+	while (!found && getline(&line, &cap, f) > 0) {
+		/* The mount point is the fifth field, with blanks and the like
+		 * as \ooo. */
+		char *m = line;
+		for (int i = 0; i < 4 && m; i++)
+			if ((m = strchr(m, ' ')))
+				m++;
+		if (!m)
+			continue;
+		char *o = m;
+		for (const char *r = m; *r && *r != ' ' && *r != '\n'; r++) {
+			if (r[0] == '\\' && r[1] >= '0' && r[1] <= '3' && r[2] &&
+			    r[3]) {
+				*o++ = (r[1] - '0') << 6 | (r[2] - '0') << 3 |
+					(r[3] - '0');
+				r += 3;
+			} else {
+				*o++ = *r;
+			}
+		}
+		*o = 0;
+		found = !strncmp(m, real, n) && m[n] == '/';
+	}
+	free(line);
+	fclose(f);
+	return found;
+}
+
 static int same_dir(const char *a, const char *b)
 {
 	struct stat x, y;
@@ -1499,7 +1542,7 @@ static int tool(int which, const char *a1, const char *a2, const char *a3,
  * into place from there, so a partial copy never shows under the real name
  * and the final name is picked only when it is used: nothing is ever
  * overwritten, not even on a case-insensitive file system. Delete is
- * rm -rf, which neither enters nor removes other mounts.
+ * rm -rf, after making sure there is no mount in the way.
  */
 static void worker(int op, const char *sdir, char **names, int n,
 	const char *ddir, int out)
@@ -1517,10 +1560,18 @@ static void worker(int op, const char *sdir, char **names, int n,
 			continue;
 		}
 		int isdir = S_ISDIR(st.st_mode);
+		if (isdir && op != OP_COPY && is_mount(src)) {
+			report(out, "%s is a mount point, not %s", nm, op_ed[op]);
+			continue;
+		}
 		if (op == OP_DELETE) {
-			if (isdir && is_mount(src))
-				report(out, "%s is a mount point, not deleted",
+			int below = isdir ? mount_below(src) : 0;
+			if (below > 0)
+				report(out, "%s has a mount point in it, not deleted",
 					nm);
+			else if (below < 0)
+				report(out, "%s: cannot check for mount points: %s",
+					nm, strerror(errno));
 			else if (tool(2, "-rf", "--one-file-system", "--", src,
 			    msg, sizeof msg) < 0)
 				report(out, "%s", msg);
@@ -1534,6 +1585,15 @@ static void worker(int op, const char *sdir, char **names, int n,
 				report(out, "%s: %s", nm, strerror(errno));
 				continue;
 			}
+			/* mv's removal after the copy would empty what is mounted. */
+			int below = isdir ? mount_below(src) : 0;
+			if (below != 0) {
+				report(out, below > 0 ?
+					"%s has a mount point in it, not moved" :
+					"%s: cannot check for mount points, not moved",
+					nm);
+				continue;
+			}
 		}
 		if (join(tmp, ddir, ".mfm-XXXXXX") < 0 || !mkdtemp(tmp) ||
 		    join(t, tmp, nm) < 0) {
@@ -1543,11 +1603,17 @@ static void worker(int op, const char *sdir, char **names, int n,
 		int ok = op == OP_COPY ?
 			tool(0, "-a", "--", src, t, msg, sizeof msg) == 0 :
 			tool(1, "--", src, t, NULL, msg, sizeof msg) == 0;
-		/* A failed mv may have removed part of the source already:
-		 * whatever arrived is kept. A failed copy is cleaned up. */
-		if (op == OP_MOVE && !ok && lstat(t, &st) < 0) {
-			report(out, "%s", msg);
-			rmdir(tmp);
+		/* A failed mv may have removed part of the source already, so
+		 * whatever arrived is kept, but not under the real name: it may
+		 * be half a file. A failed copy is cleaned up. */
+		if (op == OP_MOVE && !ok) {
+			if (lstat(t, &st) < 0) {
+				report(out, "%s", msg);
+				rmdir(tmp);
+			} else {
+				report(out, "%s (what arrived is in %s)", msg,
+					strrchr(tmp, '/') + 1);
+			}
 			continue;
 		}
 		if (op == OP_COPY && !ok) {
@@ -1561,8 +1627,6 @@ static void worker(int op, const char *sdir, char **names, int n,
 			continue;
 		}
 		rmdir(tmp);
-		if (!ok)
-			report(out, "%s (moved only partly)", msg);
 	}
 	_exit(0);
 }
