@@ -1,6 +1,6 @@
 #!/bin/sh
-# Build mfm in a container and run tests/files.sh there, for hosts without Xvfb and
-# xdotool or that restrict user namespaces (Ubuntu's AppArmor does). The source is
+# Build mfm in a container and run the tests there, for hosts without Xvfb, xdotool and
+# ImageMagick or that restrict user namespaces (Ubuntu's AppArmor does). The source is
 # mounted read-only and built from a copy. Takes podman or docker.
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
@@ -16,4 +16,5 @@ exec "$engine" run --rm --security-opt seccomp=unconfined \
 		cd /tmp/b
 		make -s clean
 		make -s
+		tests/ui.sh
 		tests/files.sh'

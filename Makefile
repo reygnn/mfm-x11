@@ -22,9 +22,10 @@ install: mfm
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/mfm
 
-# Needs Xvfb, xdotool and unprivileged user namespaces, and is skipped without the
-# latter. test-docker brings them along.
+# Needs Xvfb, xdotool and ImageMagick. files.sh also needs unprivileged user namespaces,
+# and is skipped without them. test-docker brings it all along.
 test: mfm
+	tests/ui.sh
 	tests/files.sh
 
 test-docker:

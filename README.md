@@ -171,10 +171,11 @@ Alles darüber hinaus (Rechte, Links, Archive, …): Ctrl+T und die Shell.
 
     make test
 
-fährt mfm unter einem eigenen Xvfb mit xdotool und prüft Dateioperationen mit
-echten Mounts in einem privaten Namespace (`tests/files.sh`). Es braucht `xvfb`
-und `xdotool` sowie User-Namespaces, ohne die der Test übersprungen wird. Eine
-laufende Sitzung fasst er nicht an.
+fährt mfm unter einem eigenen Xvfb mit simulierter Maus und Tastatur und prüft
+Dateien und Screenshots (`tests/ui.sh`), dazu Dateioperationen mit echten Mounts in
+einem privaten Namespace (`tests/files.sh`; ohne User-Namespaces übersprungen). Es
+braucht `xvfb`, `xdotool` und `imagemagick`. Die Tests fassen eine laufende Sitzung
+nicht an.
 
 Ubuntu sperrt User-Namespaces per AppArmor. Dort oder ohne die Pakete bringt
 
