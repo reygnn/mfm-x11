@@ -167,6 +167,21 @@ Fehlt es, steht das in der Statuszeile.
 
 Alles darüber hinaus (Rechte, Links, Archive, …): Ctrl+T und die Shell.
 
+## Tests
+
+    make test
+
+fährt mfm unter einem eigenen Xvfb mit xdotool und prüft Dateioperationen mit
+echten Mounts in einem privaten Namespace (`tests/files.sh`). Es braucht `xvfb`
+und `xdotool` sowie User-Namespaces, ohne die der Test übersprungen wird. Eine
+laufende Sitzung fasst er nicht an.
+
+Ubuntu sperrt User-Namespaces per AppArmor. Dort oder ohne die Pakete bringt
+
+    make test-docker
+
+alles in einem Container mit (podman oder docker).
+
 ## Lizenz
 
 MIT, siehe [LICENSE](LICENSE).

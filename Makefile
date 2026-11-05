@@ -22,7 +22,15 @@ install: mfm
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/mfm
 
+# Needs Xvfb, xdotool and unprivileged user namespaces, and is skipped without the
+# latter. test-docker brings them along.
+test: mfm
+	tests/files.sh
+
+test-docker:
+	tests/docker/run.sh
+
 clean:
 	rm -f mfm
 
-.PHONY: all install uninstall clean
+.PHONY: all install uninstall test test-docker clean
